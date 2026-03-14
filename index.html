@@ -6,19 +6,10 @@
   <style>
     body { margin: 0; background: #000; overflow: hidden; }
     #player { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
-    #overlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      display: flex; align-items: center; justify-content: center;
-      color: #fff; font-family: sans-serif; font-size: 2em;
-      background: rgba(0,0,0,0.7); z-index: 10;
-      transition: opacity 0.5s;
-    }
-    #overlay.hidden { opacity: 0; pointer-events: none; }
   </style>
 </head>
 <body>
   <video id="player" autoplay></video>
-  <div id="overlay">Loading...</div>
 
   <!-- hls.js for IPTV HLS stream support -->
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -29,114 +20,78 @@
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
     const video = document.getElementById('player');
-    const overlay = document.getElementById('overlay');
     let hls = null;
 
-    // Intercept LOAD requests to use hls.js instead of native playback
+    // Tell the Cast framework to use our video element
+    playerManager.setMediaElement(video);
+
+    // Intercept LOAD requests — set up hls.js then return the request
+    // so the Cast framework still tracks the media session properly
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
         const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
-        const title = loadRequestData.media?.metadata?.title || '';
-
         console.log('[Receiver] LOAD intercepted:', url);
-        overlay.textContent = title || 'Loading...';
-        overlay.classList.remove('hidden');
 
-        // If HLS stream, handle with hls.js
-        if (url && (url.includes('.m3u8') || url.includes('.ts') ||
-            (loadRequestData.media.contentType || '').includes('mpegurl') ||
-            (loadRequestData.media.contentType || '').includes('mp2t'))) {
+        const isHls = url && (
+          url.includes('.m3u8') ||
+          (loadRequestData.media.contentType || '').toLowerCase().includes('mpegurl')
+        );
 
-          // Destroy previous instance
-          if (hls) {
-            hls.destroy();
-            hls = null;
-          }
+        if (isHls && Hls.isSupported()) {
+          // Destroy previous hls instance
+          if (hls) { hls.destroy(); hls = null; }
 
-          if (Hls.isSupported()) {
-            hls = new Hls({
-              enableWorker: true,
-              lowLatencyMode: true,
-              backBufferLength: 10,
-              maxBufferLength: 30,
-              maxMaxBufferLength: 60,
-              // Disable ABR to reduce buffering on live streams
-              abrEwmaDefaultEstimate: 5000000,
-              startLevel: -1,
-            });
+          hls = new Hls({
+            enableWorker: true,
+            lowLatencyMode: true,
+            backBufferLength: 10,
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            abrEwmaDefaultEstimate: 5000000,
+            startLevel: -1,
+          });
 
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-              console.log('[Receiver] HLS manifest parsed, starting playback');
-              video.play().then(() => {
-                overlay.classList.add('hidden');
-              }).catch(err => {
-                console.error('[Receiver] Play error:', err);
-                video.muted = true;
-                video.play().then(() => overlay.classList.add('hidden'));
-              });
-            });
-
-            hls.on(Hls.Events.ERROR, (event, data) => {
-              console.error('[Receiver] HLS error:', data.type, data.details);
-              if (data.fatal) {
-                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                  console.log('[Receiver] Network error, attempting recovery...');
-                  hls.startLoad();
-                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                  console.log('[Receiver] Media error, attempting recovery...');
-                  hls.recoverMediaError();
-                } else {
-                  console.error('[Receiver] Fatal error, cannot recover');
-                  overlay.textContent = 'Stream Error';
-                  overlay.classList.remove('hidden');
-                }
+          hls.on(Hls.Events.ERROR, (event, data) => {
+            console.error('[Receiver] HLS error:', data.type, data.details);
+            if (data.fatal) {
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
+              } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
               }
-            });
+            }
+          });
 
-            hls.loadSource(url);
-            hls.attachMedia(video);
+          // Attach hls.js to the video element — it takes over via MSE
+          hls.loadSource(url);
+          hls.attachMedia(video);
 
-            // Return null to prevent the default Cast player from handling the load
-            return null;
-          }
+          // Tell the Cast framework this uses MPEG-TS segments
+          // so it doesn't try its own incompatible HLS parsing
+          loadRequestData.media.hlsSegmentFormat =
+            cast.framework.messages.HlsSegmentFormat.TS;
+          loadRequestData.media.hlsVideoSegmentFormat =
+            cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
         }
 
-        // For non-HLS content, let the default Cast player handle it
+        // Return the request so the Cast framework tracks the media session
+        // (handles play/pause/stop/status updates for the sender)
         return loadRequestData;
       }
     );
 
-    // Handle STOP
+    // Clean up hls.js on stop
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.STOP,
       (requestData) => {
-        if (hls) {
-          hls.destroy();
-          hls = null;
-        }
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
-        overlay.textContent = 'Stopped';
-        overlay.classList.remove('hidden');
+        if (hls) { hls.destroy(); hls = null; }
         return requestData;
       }
     );
 
-    // Handle media status for proper Cast UI integration
-    playerManager.addEventListener(
-      cast.framework.events.EventType.MEDIA_STATUS,
-      (event) => {
-        console.log('[Receiver] Media status:', event);
-      }
-    );
-
-    // Start the receiver
-    const options = new cast.framework.CastReceiverOptions();
-    options.disableIdleTimeout = true;
-    context.start(options);
-
+    // Start the receiver — disable idle timeout for live TV
+    context.start({ disableIdleTimeout: true });
     console.log('[Receiver] TV Guide Cast Receiver started');
   </script>
 </body>
