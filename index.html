@@ -6,18 +6,10 @@
   <style>
     body { margin: 0; background: #000; overflow: hidden; }
     video { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
-    #status {
-      position: fixed; bottom: 20px; left: 20px; right: 20px;
-      color: #0f0; font-family: monospace; font-size: 14px;
-      background: rgba(0,0,0,0.8); padding: 10px; border-radius: 6px;
-      max-height: 40vh; overflow-y: auto; z-index: 9999;
-      display: none;
-    }
   </style>
 </head>
 <body>
   <video id="player" autoplay></video>
-  <div id="status"></div>
 
   <!-- hls.js for IPTV HLS stream support -->
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -25,46 +17,16 @@
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
   <script>
-    const statusEl = document.getElementById('status');
-    let logLines = [];
-    function log(msg) {
-      const ts = new Date().toLocaleTimeString();
-      const line = '[' + ts + '] ' + msg;
-      console.log(line);
-      logLines.push(line);
-      if (logLines.length > 50) logLines.shift();
-      statusEl.style.display = 'block';
-      statusEl.textContent = logLines.join('\n');
-      // Auto-hide status after 30s of no new messages
-      clearTimeout(statusEl._hideTimer);
-      statusEl._hideTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 30000);
-    }
-
-    log('Receiver loading...');
-
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
     const video = document.getElementById('player');
     let hls = null;
-
-    // Listen for player errors
-    playerManager.addEventListener(
-      cast.framework.events.EventType.ERROR,
-      (event) => { log('PlayerManager ERROR: ' + JSON.stringify(event)); }
-    );
-
-    playerManager.addEventListener(
-      cast.framework.events.EventType.MEDIA_STATUS,
-      (event) => { log('MEDIA_STATUS: state=' + event.mediaStatus?.playerState); }
-    );
 
     // Intercept LOAD — use hls.js for HLS streams, let CAF handle others
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
         const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
-        log('LOAD intercepted: ' + (url || 'no url').substring(0, 120));
-        log('contentType: ' + (loadRequestData.media.contentType || 'none'));
 
         const isHls = url && (
           url.includes('.m3u8') ||
@@ -72,19 +34,8 @@
           (loadRequestData.media.contentType || '').toLowerCase().includes('mpegurl')
         );
 
-        if (!isHls) {
-          log('Not HLS — letting CAF handle natively');
-          return loadRequestData;
-        }
+        if (!isHls || !Hls.isSupported()) return loadRequestData;
 
-        if (!Hls.isSupported()) {
-          log('hls.js not supported — trying native');
-          return loadRequestData;
-        }
-
-        log('Setting up hls.js...');
-
-        // Destroy previous instance
         if (hls) { hls.destroy(); hls = null; }
 
         return new Promise((resolve) => {
@@ -99,14 +50,10 @@
 
           let resolved = false;
 
-          hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-            log('Manifest parsed: ' + data.levels.length + ' levels');
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
             video.play().then(() => {
-              log('Playback started!');
               if (!resolved) {
                 resolved = true;
-                // Set media info so sender knows we're playing
-                // but set contentUrl to empty so CAF doesn't try to load the URL itself
                 loadRequestData.media.contentUrl = '';
                 loadRequestData.media.hlsSegmentFormat =
                   cast.framework.messages.HlsSegmentFormat.TS;
@@ -114,74 +61,47 @@
                   cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
                 resolve(loadRequestData);
               }
-            }).catch((err) => {
-              log('Play failed: ' + err.message + ' — trying muted');
+            }).catch(() => {
               video.muted = true;
               video.play().then(() => {
-                log('Muted playback started');
                 if (!resolved) {
                   resolved = true;
                   loadRequestData.media.contentUrl = '';
                   resolve(loadRequestData);
                 }
-              }).catch((err2) => {
-                log('Muted play also failed: ' + err2.message);
+              }).catch(() => {
                 if (!resolved) { resolved = true; resolve(loadRequestData); }
               });
             });
           });
 
           hls.on(Hls.Events.ERROR, (event, data) => {
-            log('HLS error: ' + data.type + ' / ' + data.details + (data.fatal ? ' [FATAL]' : ''));
             if (data.fatal) {
-              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                log('Attempting recovery (network)...');
-                hls.startLoad();
-              } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                log('Attempting recovery (media)...');
-                hls.recoverMediaError();
-              } else {
-                log('Unrecoverable error');
-                if (!resolved) { resolved = true; resolve(loadRequestData); }
-              }
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+              else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+              else if (!resolved) { resolved = true; resolve(loadRequestData); }
             }
           });
 
-          hls.on(Hls.Events.FRAG_LOADED, () => {
-            // Hide status once fragments are loading
-            clearTimeout(statusEl._hideTimer);
-            statusEl._hideTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 5000);
-          });
-
-          log('Loading source: ' + url.substring(0, 100));
           hls.loadSource(url);
           hls.attachMedia(video);
 
-          // Safety timeout — resolve after 15s no matter what
           setTimeout(() => {
-            if (!resolved) {
-              resolved = true;
-              log('Timeout — resolving load request');
-              resolve(loadRequestData);
-            }
+            if (!resolved) { resolved = true; resolve(loadRequestData); }
           }, 15000);
         });
       }
     );
 
-    // Clean up on stop
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.STOP,
       (requestData) => {
-        log('STOP received');
         if (hls) { hls.destroy(); hls = null; }
         return requestData;
       }
     );
 
-    // Start receiver
     context.start({ disableIdleTimeout: true });
-    log('TV Guide Cast Receiver started (hls.js v' + Hls.version + ')');
   </script>
 </body>
 </html>
