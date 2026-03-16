@@ -22,7 +22,9 @@
     const video = document.getElementById('player');
     let hls = null;
 
-    // Intercept LOAD — use hls.js for HLS streams, let CAF handle others
+    // Intercept LOAD — hls.js handles all HLS playback directly.
+    // Return null so CAF does NOT try to load the URL itself
+    // (CAF's built-in player destroys the MSE source buffers hls.js sets up).
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
@@ -36,60 +38,39 @@
 
         if (!isHls || !Hls.isSupported()) return loadRequestData;
 
+        // Destroy previous instance
         if (hls) { hls.destroy(); hls = null; }
 
-        return new Promise((resolve) => {
-          hls = new Hls({
-            enableWorker: true,
-            lowLatencyMode: true,
-            backBufferLength: 10,
-            maxBufferLength: 30,
-            maxMaxBufferLength: 60,
-            startLevel: -1,
-          });
-
-          let resolved = false;
-
-          hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            video.play().then(() => {
-              if (!resolved) {
-                resolved = true;
-                loadRequestData.media.contentUrl = '';
-                loadRequestData.media.hlsSegmentFormat =
-                  cast.framework.messages.HlsSegmentFormat.TS;
-                loadRequestData.media.hlsVideoSegmentFormat =
-                  cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
-                resolve(loadRequestData);
-              }
-            }).catch(() => {
-              video.muted = true;
-              video.play().then(() => {
-                if (!resolved) {
-                  resolved = true;
-                  loadRequestData.media.contentUrl = '';
-                  resolve(loadRequestData);
-                }
-              }).catch(() => {
-                if (!resolved) { resolved = true; resolve(loadRequestData); }
-              });
-            });
-          });
-
-          hls.on(Hls.Events.ERROR, (event, data) => {
-            if (data.fatal) {
-              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-              else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-              else if (!resolved) { resolved = true; resolve(loadRequestData); }
-            }
-          });
-
-          hls.loadSource(url);
-          hls.attachMedia(video);
-
-          setTimeout(() => {
-            if (!resolved) { resolved = true; resolve(loadRequestData); }
-          }, 15000);
+        hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true,
+          backBufferLength: 10,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          startLevel: -1,
         });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(() => {
+            video.muted = true;
+            video.play().catch(() => {});
+          });
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          if (data.fatal) {
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+          }
+        });
+
+        hls.loadSource(url);
+        hls.attachMedia(video);
+
+        // Return null — we handle playback entirely via hls.js.
+        // The sender may get a session_error for loadMedia, but
+        // the cast session stays active and video plays on the TV.
+        return null;
       }
     );
 
@@ -97,6 +78,9 @@
       cast.framework.messages.MessageType.STOP,
       (requestData) => {
         if (hls) { hls.destroy(); hls = null; }
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
         return requestData;
       }
     );
