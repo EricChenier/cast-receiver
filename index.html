@@ -22,9 +22,60 @@
     const video = document.getElementById('player');
     let hls = null;
 
+    function createHls() {
+      return new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 10,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        startLevel: -1,
+      });
+    }
+
+    function loadStream(url) {
+      // Destroy previous instance
+      if (hls) { hls.destroy(); hls = null; }
+
+      hls = createHls();
+      let retryCount = 0;
+      const maxRetries = 5;
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.muted = false;
+        video.play().catch(() => {
+          // Autoplay blocked — start muted then unmute after a short delay
+          video.muted = true;
+          video.play().then(() => {
+            setTimeout(() => { video.muted = false; }, 1500);
+          }).catch(() => {});
+        });
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (!data.fatal) return;
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          retryCount++;
+          if (retryCount <= maxRetries) {
+            // Exponential backoff retry
+            setTimeout(() => hls.startLoad(), 1000 * retryCount);
+          } else {
+            // Rebuild HLS instance from scratch
+            retryCount = 0;
+            loadStream(url);
+          }
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+        }
+      });
+
+      hls.loadSource(url);
+      hls.attachMedia(video);
+    }
+
     // Intercept LOAD — hls.js handles all HLS playback directly.
-    // Return null so CAF does NOT try to load the URL itself
-    // (CAF's built-in player destroys the MSE source buffers hls.js sets up).
+    // Return null so CAF does NOT try to load the URL itself.
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
@@ -38,38 +89,9 @@
 
         if (!isHls || !Hls.isSupported()) return loadRequestData;
 
-        // Destroy previous instance
-        if (hls) { hls.destroy(); hls = null; }
-
-        hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: true,
-          backBufferLength: 10,
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
-          startLevel: -1,
-        });
-
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          video.play().catch(() => {
-            video.muted = true;
-            video.play().catch(() => {});
-          });
-        });
-
-        hls.on(Hls.Events.ERROR, (event, data) => {
-          if (data.fatal) {
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-          }
-        });
-
-        hls.loadSource(url);
-        hls.attachMedia(video);
+        loadStream(url);
 
         // Return null — we handle playback entirely via hls.js.
-        // The sender may get a session_error for loadMedia, but
-        // the cast session stays active and video plays on the TV.
         return null;
       }
     );
