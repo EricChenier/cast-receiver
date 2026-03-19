@@ -6,10 +6,22 @@
   <style>
     body { margin: 0; background: #000; overflow: hidden; }
     video { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
+    #debugOverlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      pointer-events: none; z-index: 9999;
+      font-family: monospace; font-size: 14px; color: #0f0;
+      padding: 20px; overflow-y: auto;
+      background: rgba(0,0,0,0.7);
+    }
+    #debugOverlay div { margin-bottom: 2px; white-space: pre-wrap; word-break: break-all; }
+    .err { color: #f44; }
+    .warn { color: #fa0; }
+    .info { color: #0f0; }
   </style>
 </head>
 <body>
   <video id="player" autoplay></video>
+  <div id="debugOverlay"></div>
 
   <!-- hls.js for IPTV HLS stream support -->
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -17,10 +29,44 @@
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
   <script>
+    const overlay = document.getElementById('debugOverlay');
+    const maxLines = 40;
+    let lineCount = 0;
+
+    function log(msg, cls) {
+      cls = cls || 'info';
+      const d = document.createElement('div');
+      d.className = cls;
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      d.textContent = '[' + ts + '] ' + msg;
+      overlay.appendChild(d);
+      lineCount++;
+      if (lineCount > maxLines) overlay.removeChild(overlay.firstChild);
+      overlay.scrollTop = overlay.scrollHeight;
+    }
+
+    log('Receiver loaded. hls.js supported: ' + Hls.isSupported());
+    log('hls.js version: ' + Hls.version);
+
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
     const video = document.getElementById('player');
     let hls = null;
+
+    // Log video element events
+    ['playing','pause','waiting','stalled','error','loadedmetadata','canplay','emptied','ended','suspend','abort'].forEach(evt => {
+      video.addEventListener(evt, () => {
+        let extra = '';
+        if (evt === 'loadedmetadata' || evt === 'canplay') {
+          extra = ' | ' + video.videoWidth + 'x' + video.videoHeight;
+          extra += ' | duration=' + video.duration;
+        }
+        if (evt === 'error' && video.error) {
+          extra = ' | code=' + video.error.code + ' msg=' + (video.error.message || 'none');
+        }
+        log('VIDEO.' + evt + extra, evt === 'error' ? 'err' : 'info');
+      });
+    });
 
     function createHls() {
       return new Hls({
@@ -30,10 +76,13 @@
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
         startLevel: -1,
+        debug: false,
       });
     }
 
     function loadStream(url) {
+      log('loadStream: ' + url);
+
       // Destroy previous instance
       if (hls) { hls.destroy(); hls = null; }
 
@@ -41,57 +90,105 @@
       let retryCount = 0;
       const maxRetries = 5;
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      hls.on(Hls.Events.MANIFEST_LOADING, () => log('HLS: MANIFEST_LOADING'));
+      hls.on(Hls.Events.MANIFEST_LOADED, (e, d) => {
+        log('HLS: MANIFEST_LOADED levels=' + (d.levels ? d.levels.length : '?'));
+        if (d.levels) {
+          d.levels.forEach((lvl, i) => {
+            log('  level[' + i + ']: ' + lvl.width + 'x' + lvl.height + ' codec=' + (lvl.codecSet || lvl.videoCodec || 'unknown') + ' audio=' + (lvl.audioCodec || 'unknown'));
+          });
+        }
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (e, d) => {
+        log('HLS: MANIFEST_PARSED levels=' + d.levels + ' audio=' + d.audioTracks + ' firstLevel=' + d.firstLevel);
         video.muted = false;
-        video.play().catch(() => {
-          // Autoplay blocked — start muted then unmute after a short delay
+        video.play().then(() => {
+          log('video.play() OK, muted=' + video.muted);
+        }).catch((err) => {
+          log('video.play() FAILED: ' + err.message, 'warn');
           video.muted = true;
           video.play().then(() => {
-            setTimeout(() => { video.muted = false; }, 1500);
-          }).catch(() => {});
+            log('video.play() OK (muted), will unmute in 1.5s');
+            setTimeout(() => { video.muted = false; log('Unmuted'); }, 1500);
+          }).catch((err2) => {
+            log('video.play() muted ALSO FAILED: ' + err2.message, 'err');
+          });
         });
       });
 
+      hls.on(Hls.Events.LEVEL_SWITCHING, (e, d) => {
+        log('HLS: LEVEL_SWITCHING to ' + d.level);
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, (e, d) => {
+        log('HLS: AUDIO_TRACK_SWITCHING id=' + d.id);
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, (e, d) => {
+        if (d.frag.sn <= 2) {
+          log('HLS: FRAG_LOADED sn=' + d.frag.sn + ' type=' + d.frag.type + ' dur=' + d.frag.duration.toFixed(1) + 's');
+        }
+      });
+
+      hls.on(Hls.Events.BUFFER_CODECS, (e, d) => {
+        const codecs = Object.keys(d).map(k => k + ':' + (d[k].codec || '?')).join(', ');
+        log('HLS: BUFFER_CODECS ' + codecs);
+      });
+
       hls.on(Hls.Events.ERROR, (event, data) => {
+        const details = 'type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal;
+        const extra = data.reason ? ' reason=' + data.reason : '';
+        const resp = data.response ? ' status=' + data.response.code : '';
+        const frag = data.frag ? ' frag=' + data.frag.sn : '';
+        log('HLS ERROR: ' + details + extra + resp + frag, data.fatal ? 'err' : 'warn');
+
         if (!data.fatal) return;
 
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           retryCount++;
+          log('Network retry ' + retryCount + '/' + maxRetries, 'warn');
           if (retryCount <= maxRetries) {
-            // Exponential backoff retry
             setTimeout(() => hls.startLoad(), 1000 * retryCount);
           } else {
-            // Rebuild HLS instance from scratch
+            log('Max retries reached, rebuilding HLS...', 'err');
             retryCount = 0;
             loadStream(url);
           }
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          log('Attempting recoverMediaError...', 'warn');
           hls.recoverMediaError();
+        } else {
+          log('Unrecoverable error type: ' + data.type, 'err');
         }
       });
 
       hls.loadSource(url);
       hls.attachMedia(video);
+      log('hls.loadSource + attachMedia called');
     }
 
     // Intercept LOAD — hls.js handles all HLS playback directly.
-    // Return null so CAF does NOT try to load the URL itself.
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
         const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
+        const ct = loadRequestData.media.contentType || '';
+        log('LOAD intercepted: contentType=' + ct);
+        log('URL: ' + (url || 'NONE'), url ? 'info' : 'err');
 
         const isHls = url && (
           url.includes('.m3u8') ||
           url.includes('/live/') ||
-          (loadRequestData.media.contentType || '').toLowerCase().includes('mpegurl')
+          ct.toLowerCase().includes('mpegurl')
         );
+
+        log('isHls=' + isHls + ' hlsSupported=' + Hls.isSupported());
 
         if (!isHls || !Hls.isSupported()) return loadRequestData;
 
         loadStream(url);
 
-        // Return null — we handle playback entirely via hls.js.
         return null;
       }
     );
@@ -99,6 +196,7 @@
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.STOP,
       (requestData) => {
+        log('STOP received');
         if (hls) { hls.destroy(); hls = null; }
         video.pause();
         video.removeAttribute('src');
@@ -108,6 +206,7 @@
     );
 
     context.start({ disableIdleTimeout: true });
+    log('CAF context started');
   </script>
 </body>
 </html>
