@@ -6,22 +6,10 @@
   <style>
     body { margin: 0; background: #000; overflow: hidden; }
     video { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
-    #debugOverlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      pointer-events: none; z-index: 9999;
-      font-family: monospace; font-size: 14px; color: #0f0;
-      padding: 20px; overflow-y: auto;
-      background: rgba(0,0,0,0.7);
-    }
-    #debugOverlay div { margin-bottom: 2px; white-space: pre-wrap; word-break: break-all; }
-    .err { color: #f44; }
-    .warn { color: #fa0; }
-    .info { color: #0f0; }
   </style>
 </head>
 <body>
   <video id="player" autoplay></video>
-  <div id="debugOverlay"></div>
 
   <!-- hls.js for IPTV HLS stream support -->
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -29,44 +17,22 @@
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
   <script>
-    const overlay = document.getElementById('debugOverlay');
-    const maxLines = 40;
-    let lineCount = 0;
-
-    function log(msg, cls) {
-      cls = cls || 'info';
-      const d = document.createElement('div');
-      d.className = cls;
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-      d.textContent = '[' + ts + '] ' + msg;
-      overlay.appendChild(d);
-      lineCount++;
-      if (lineCount > maxLines) overlay.removeChild(overlay.firstChild);
-      overlay.scrollTop = overlay.scrollHeight;
-    }
-
-    log('Receiver loaded. hls.js supported: ' + Hls.isSupported());
-    log('hls.js version: ' + Hls.version);
-
+    const MSG_NS = 'urn:x-cast:com.tvguide.log';
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
     const video = document.getElementById('player');
     let hls = null;
 
-    // Log video element events
-    ['playing','pause','waiting','stalled','error','loadedmetadata','canplay','emptied','ended','suspend','abort'].forEach(evt => {
-      video.addEventListener(evt, () => {
-        let extra = '';
-        if (evt === 'loadedmetadata' || evt === 'canplay') {
-          extra = ' | ' + video.videoWidth + 'x' + video.videoHeight;
-          extra += ' | duration=' + video.duration;
-        }
-        if (evt === 'error' && video.error) {
-          extra = ' | code=' + video.error.code + ' msg=' + (video.error.message || 'none');
-        }
-        log('VIDEO.' + evt + extra, evt === 'error' ? 'err' : 'info');
-      });
-    });
+    // Send log message back to sender (phone)
+    function sendLog(msg, level) {
+      level = level || 'info';
+      try {
+        context.sendCustomMessage(MSG_NS, undefined, { level: level, message: msg });
+      } catch (e) { /* ignore if no sender connected */ }
+    }
+
+    // Register custom message namespace
+    context.addCustomMessageListener(MSG_NS, function() {});
 
     function createHls() {
       return new Hls({
@@ -76,170 +42,133 @@
         maxBufferLength: 30,
         maxMaxBufferLength: 60,
         startLevel: -1,
-        debug: false,
       });
     }
 
     function loadStream(url) {
-      log('loadStream: ' + url);
+      sendLog('Loading stream...');
 
-      // Destroy previous instance
       if (hls) { hls.destroy(); hls = null; }
 
       hls = createHls();
       let retryCount = 0;
       const maxRetries = 5;
 
-      hls.on(Hls.Events.MANIFEST_LOADING, () => log('HLS: MANIFEST_LOADING'));
-      hls.on(Hls.Events.MANIFEST_LOADED, (e, d) => {
-        log('HLS: MANIFEST_LOADED levels=' + (d.levels ? d.levels.length : '?'));
+      hls.on(Hls.Events.MANIFEST_LOADED, function(e, d) {
+        var lvlCount = d.levels ? d.levels.length : 0;
+        sendLog('Manifest loaded, ' + lvlCount + ' level(s)');
         if (d.levels) {
-          d.levels.forEach((lvl, i) => {
-            log('  level[' + i + ']: ' + lvl.width + 'x' + lvl.height + ' codec=' + (lvl.codecSet || lvl.videoCodec || 'unknown') + ' audio=' + (lvl.audioCodec || 'unknown'));
+          d.levels.forEach(function(lvl, i) {
+            var vc = lvl.codecSet || lvl.videoCodec || 'unknown';
+            var ac = lvl.audioCodec || 'unknown';
+            sendLog('Level ' + i + ': ' + (lvl.width || '?') + 'x' + (lvl.height || '?') + ' video=' + vc + ' audio=' + ac);
           });
         }
       });
 
-      hls.on(Hls.Events.MANIFEST_PARSED, (e, d) => {
-        log('HLS: MANIFEST_PARSED levels=' + d.levels + ' audio=' + d.audioTracks + ' firstLevel=' + d.firstLevel);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        sendLog('Manifest parsed, starting playback');
         video.muted = false;
-        video.play().then(() => {
-          log('video.play() OK, muted=' + video.muted);
-        }).catch((err) => {
-          log('video.play() FAILED: ' + err.message, 'warn');
+        video.play().then(function() {
+          sendLog('Playing (unmuted)');
+        }).catch(function() {
           video.muted = true;
-          video.play().then(() => {
-            log('video.play() OK (muted), will unmute in 1.5s');
-            setTimeout(() => { video.muted = false; log('Unmuted'); }, 1500);
-          }).catch((err2) => {
-            log('video.play() muted ALSO FAILED: ' + err2.message, 'err');
+          video.play().then(function() {
+            sendLog('Playing (muted, will unmute)');
+            setTimeout(function() { video.muted = false; sendLog('Unmuted'); }, 1500);
+          }).catch(function(err) {
+            sendLog('Play failed: ' + err.message, 'error');
           });
         });
       });
 
-      hls.on(Hls.Events.LEVEL_SWITCHING, (e, d) => {
-        log('HLS: LEVEL_SWITCHING to ' + d.level);
+      hls.on(Hls.Events.BUFFER_CODECS, function(e, d) {
+        var codecs = Object.keys(d).map(function(k) { return k + ':' + (d[k].codec || '?'); }).join(', ');
+        sendLog('Codecs: ' + codecs);
       });
 
-      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, (e, d) => {
-        log('HLS: AUDIO_TRACK_SWITCHING id=' + d.id);
-      });
-
-      hls.on(Hls.Events.FRAG_LOADED, (e, d) => {
-        if (d.frag.sn <= 2) {
-          log('HLS: FRAG_LOADED sn=' + d.frag.sn + ' type=' + d.frag.type + ' dur=' + d.frag.duration.toFixed(1) + 's');
-        }
-      });
-
-      hls.on(Hls.Events.BUFFER_CODECS, (e, d) => {
-        const codecs = Object.keys(d).map(k => k + ':' + (d[k].codec || '?')).join(', ');
-        log('HLS: BUFFER_CODECS ' + codecs);
-      });
-
-      let mediaRecoveryAttempt = 0;
-      hls.on(Hls.Events.ERROR, (event, data) => {
-        const details = 'type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal;
-        const extra = data.reason ? ' reason=' + data.reason : '';
-        const resp = data.response ? ' status=' + data.response.code : '';
-        const frag = data.frag ? ' frag=' + data.frag.sn : '';
-        log('HLS ERROR: ' + details + extra + resp + frag, data.fatal ? 'err' : 'warn');
-
+      var mediaRecoveryAttempt = 0;
+      hls.on(Hls.Events.ERROR, function(event, data) {
         if (!data.fatal) return;
+
+        var msg = data.type + '/' + data.details;
+        if (data.reason) msg += ' (' + data.reason + ')';
+        sendLog('Error: ' + msg, 'error');
 
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           retryCount++;
-          log('Network retry ' + retryCount + '/' + maxRetries, 'warn');
           if (retryCount <= maxRetries) {
-            setTimeout(() => hls.startLoad(), 1000 * retryCount);
+            sendLog('Network retry ' + retryCount + '/' + maxRetries, 'warn');
+            setTimeout(function() { hls.startLoad(); }, 1000 * retryCount);
           } else {
-            log('Max retries reached, rebuilding HLS...', 'err');
+            sendLog('Max retries, rebuilding...', 'warn');
             retryCount = 0;
             loadStream(url);
           }
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           mediaRecoveryAttempt++;
           if (data.details === 'bufferAddCodecError') {
-            log('bufferAddCodecError — codec unsupported by Chromecast MSE', 'err');
-            // Try swapAudioCodec first, then recoverMediaError
             if (mediaRecoveryAttempt === 1) {
-              log('Attempt 1: swapAudioCodec...', 'warn');
+              sendLog('Codec error — trying swapAudioCodec', 'warn');
               hls.swapAudioCodec();
               hls.recoverMediaError();
-            } else if (mediaRecoveryAttempt === 2) {
-              // Try next level if available
+            } else {
+              // Check if any H.264 level exists
               var levels = hls.levels || [];
-              var cur = hls.currentLevel;
-              log('Attempt 2: current level=' + cur + ' total=' + levels.length, 'warn');
               var found = false;
               for (var i = 0; i < levels.length; i++) {
-                if (i !== cur) {
-                  var vc = levels[i].videoCodec || levels[i].codecSet || '';
-                  log('Trying level ' + i + ' codec=' + vc, 'warn');
-                  // Prefer H.264 (avc) levels
-                  if (vc.indexOf('avc') >= 0) {
-                    hls.currentLevel = i;
-                    hls.recoverMediaError();
-                    found = true;
-                    break;
-                  }
+                var vc = levels[i].videoCodec || levels[i].codecSet || '';
+                if (vc.indexOf('avc') >= 0) {
+                  hls.currentLevel = i;
+                  hls.recoverMediaError();
+                  found = true;
+                  sendLog('Trying H.264 level ' + i, 'warn');
+                  break;
                 }
               }
               if (!found) {
-                log('No H.264 level found. Stream codec unsupported on Chromecast.', 'err');
-                log('This stream uses a codec (likely HEVC) that cannot play via Cast.', 'err');
+                sendLog('UNSUPPORTED_CODEC: This channel uses HEVC which cannot be cast', 'error');
               }
-            } else {
-              log('All recovery attempts exhausted. Codec not supported.', 'err');
             }
           } else {
-            log('Attempting recoverMediaError (attempt ' + mediaRecoveryAttempt + ')...', 'warn');
             if (mediaRecoveryAttempt <= 3) {
               hls.recoverMediaError();
             } else {
-              log('Max media recovery attempts reached, rebuilding...', 'err');
               mediaRecoveryAttempt = 0;
               loadStream(url);
             }
           }
-        } else {
-          log('Unrecoverable error type: ' + data.type, 'err');
         }
       });
 
       hls.loadSource(url);
       hls.attachMedia(video);
-      log('hls.loadSource + attachMedia called');
     }
 
-    // Intercept LOAD — hls.js handles all HLS playback directly.
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
-      (loadRequestData) => {
-        const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
-        const ct = loadRequestData.media.contentType || '';
-        log('LOAD intercepted: contentType=' + ct);
-        log('URL: ' + (url || 'NONE'), url ? 'info' : 'err');
+      function(loadRequestData) {
+        var url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
+        var ct = loadRequestData.media.contentType || '';
 
-        const isHls = url && (
+        var isHls = url && (
           url.includes('.m3u8') ||
           url.includes('/live/') ||
           ct.toLowerCase().includes('mpegurl')
         );
 
-        log('isHls=' + isHls + ' hlsSupported=' + Hls.isSupported());
-
         if (!isHls || !Hls.isSupported()) return loadRequestData;
 
+        sendLog('LOAD: ' + (url ? url.split('/').pop() : 'none'));
         loadStream(url);
-
         return null;
       }
     );
 
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.STOP,
-      (requestData) => {
-        log('STOP received');
+      function(requestData) {
+        sendLog('Stopped');
         if (hls) { hls.destroy(); hls = null; }
         video.pause();
         video.removeAttribute('src');
@@ -249,7 +178,6 @@
     );
 
     context.start({ disableIdleTimeout: true });
-    log('CAF context started');
   </script>
 </body>
 </html>
