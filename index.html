@@ -136,6 +136,7 @@
         log('HLS: BUFFER_CODECS ' + codecs);
       });
 
+      let mediaRecoveryAttempt = 0;
       hls.on(Hls.Events.ERROR, (event, data) => {
         const details = 'type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal;
         const extra = data.reason ? ' reason=' + data.reason : '';
@@ -156,8 +157,50 @@
             loadStream(url);
           }
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          log('Attempting recoverMediaError...', 'warn');
-          hls.recoverMediaError();
+          mediaRecoveryAttempt++;
+          if (data.details === 'bufferAddCodecError') {
+            log('bufferAddCodecError — codec unsupported by Chromecast MSE', 'err');
+            // Try swapAudioCodec first, then recoverMediaError
+            if (mediaRecoveryAttempt === 1) {
+              log('Attempt 1: swapAudioCodec...', 'warn');
+              hls.swapAudioCodec();
+              hls.recoverMediaError();
+            } else if (mediaRecoveryAttempt === 2) {
+              // Try next level if available
+              var levels = hls.levels || [];
+              var cur = hls.currentLevel;
+              log('Attempt 2: current level=' + cur + ' total=' + levels.length, 'warn');
+              var found = false;
+              for (var i = 0; i < levels.length; i++) {
+                if (i !== cur) {
+                  var vc = levels[i].videoCodec || levels[i].codecSet || '';
+                  log('Trying level ' + i + ' codec=' + vc, 'warn');
+                  // Prefer H.264 (avc) levels
+                  if (vc.indexOf('avc') >= 0) {
+                    hls.currentLevel = i;
+                    hls.recoverMediaError();
+                    found = true;
+                    break;
+                  }
+                }
+              }
+              if (!found) {
+                log('No H.264 level found. Stream codec unsupported on Chromecast.', 'err');
+                log('This stream uses a codec (likely HEVC) that cannot play via Cast.', 'err');
+              }
+            } else {
+              log('All recovery attempts exhausted. Codec not supported.', 'err');
+            }
+          } else {
+            log('Attempting recoverMediaError (attempt ' + mediaRecoveryAttempt + ')...', 'warn');
+            if (mediaRecoveryAttempt <= 3) {
+              hls.recoverMediaError();
+            } else {
+              log('Max media recovery attempts reached, rebuilding...', 'err');
+              mediaRecoveryAttempt = 0;
+              loadStream(url);
+            }
+          }
         } else {
           log('Unrecoverable error type: ' + data.type, 'err');
         }
